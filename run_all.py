@@ -167,10 +167,16 @@ def main():
                 raise ValueError(f"Unknown skip target: '{t2}'. Valid: {sorted(valid_all)}")
             skip_set.add(t2)
 
+    # -------------------------
+    # Ensure output directories
+    # -------------------------
+    outputs_root = repo_root / "outputs"
+    (outputs_root / "figures").mkdir(parents=True, exist_ok=True)
+    (outputs_root / "tables").mkdir(parents=True, exist_ok=True)
+    (outputs_root / "logs").mkdir(parents=True, exist_ok=True)
+
     # logging
-    out_root = repo_root / "outputs"
-    out_root.mkdir(parents=True, exist_ok=True)
-    log_path = out_root / f"run_all_log_{now_str()}.txt"
+    log_path = outputs_root / "logs" / f"run_all_log_{now_str()}.txt"
 
     # environment (ensure consistent working directory)
     env = dict(os.environ)
