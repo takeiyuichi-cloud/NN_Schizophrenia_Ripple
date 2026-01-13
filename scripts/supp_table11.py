@@ -1,21 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Supplementary Table S11 (template-based; recalculated, NOT using models_results_long.csv):
+Supplementary Table S11 (FINAL; S10 framework + S11 adjustments; SZ only):
 Clinical associations with ripple clustering outcomes (SZ only)
 
-This version matches the manuscript text:
-  (i) Number of high-rate ripple epochs (count)                 -> sum(n_epochs) across 80–240 Hz
-  (ii) Ripple events outside high-rate epochs (count)           -> sum(n_events_outside_epochs) across 80–240 Hz
-  (iii) Mean ripple density within high-rate epochs (events/s)  -> sum(n_events_in_epochs) / sum(sum_epoch_dur_s) across 80–240 Hz
+ALIGNMENT
+---------
+- Matches Supplementary Table S10 framework:
+    * One model per clinical predictor (PANSS POS / NEG / GEN / GAF)
+    * Count outcomes: Negative Binomial GLM (log link) + C(site_public)
+      offset = log(minutes_sum), HC3 robust SE
+    * Continuous outcome: OLS + C(site_public), HC3 robust SE
+    * BH-FDR across clinical predictors WITHIN each outcome
+- S11 adjustments:
+    * Additionally adjust for total ripple load (events_sum) + covariates
+    * Outcomes pooled across 80–240 Hz (sum across freqs for counts)
 
-Models (one predictor at a time; covariate-adjusted; SZ only):
-  - Count outcomes: Negative Binomial GLM (log link) + C(site_public), offset=log(minutes_sum), HC3
-  - Density outcome: OLS + C(site_public), HC3
-  - All models additionally adjust for total ripple load (events_sum) and covariates.
+OUTCOMES (pooled 80–240 Hz)
+--------------------------
+(i)  Number of high-rate ripple epochs (count)
+     = sum(n_epochs) across freqs
+(ii) Ripple events outside high-rate epochs (count)
+     = sum(n_events_outside_epochs) across freqs
+(iii) Peak rate within clustered ripple events (counts/s)
+     = mean(max_epoch_rate_hz) across freqs (default) or max(...) if AGG_PEAK="max"
 
-Predictors (any subset present in fig5a_source_public.csv is used):
-  - PANSS_positive, PANSS_negative, PANSS_pasological, GAF
+NOTE
+----
+Previously S11 used "Mean ripple density within high-rate epochs (events/s)" defined as:
+    sum(n_events_in_epochs) / sum(sum_epoch_dur_s)
+If you still want to keep that density metric in the table, set INCLUDE_DENSITY=True
+to add it as an additional outcome (optional).
 
 Inputs:
   <root>/data/fig5a_source_public.csv      (SAFE)
@@ -28,82 +43,55 @@ Outputs (<root>/outputs/tables/):
 
 from __future__ import annotations
 from pathlib import Path
+import re
 import numpy as np
 import pandas as pd
-import openpyxl
 
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.stats.multitest import multipletests
 
+
+# -------------------------
+# Settings
+# -------------------------
 FREQS_USE = [80, 120, 160, 200, 240]
 COVARS = ["age", "sex", "JART", "sleepiness_pre", "antipsychotics"]
+
 PRED_MAP = [
     ("PANSS_positive", "PANSS POS"),
     ("PANSS_negative", "PANSS NEG"),
-    ("PANSS_pasological", "PANSS GEN"),
+    ("PANSS_pasological", "PANSS GEN"),  # legacy column name in this project
     ("GAF", "GAF"),
 ]
 
+# Peak aggregation across freqs for the intensity outcome
+AGG_PEAK = "mean"          # "mean" (default) or "max"
+INCLUDE_DENSITY = False    # set True to also include mean_within_epoch_density as extra outcome
+
+
+# -------------------------
+# Helpers
+# -------------------------
 def canon_subject(x) -> str:
-    import re
     s = str(x).strip()
     m = re.search(r"(\d+)", s)
     return f"NB_subject_{int(m.group(1))}" if m else s
 
-def _stars(p: float) -> str:
-    if p is None or (isinstance(p, float) and (not np.isfinite(p))):
-        return ""
-    if p < 1e-4: return "****"
-    if p < 1e-3: return "***"
-    if p < 1e-2: return "**"
-    if p < 5e-2: return "*"
-    return ""
+def _resolve_panss_gen(df: pd.DataFrame) -> pd.DataFrame:
+    """Support PANSS_general as alias for PANSS_pasological if needed."""
+    df = df.copy()
+    if "PANSS_pasological" not in df.columns and "PANSS_general" in df.columns:
+        df["PANSS_pasological"] = df["PANSS_general"]
+    return df
 
-def _fmt_q(q: float) -> str:
-    if q is None or (isinstance(q, float) and (not np.isfinite(q))):
-        return ""
-    return f"{q:.4g}" + _stars(q)
+def _dropna(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    return df.replace([np.inf, -np.inf], np.nan).dropna(subset=cols, how="any").copy()
 
-def _find_template(root: Path, name: str) -> Path:
-    for c in [
-        root / "templates" / name,
-        root / "template" / name,
-        root / "supp_tables" / name,
-        Path(__file__).resolve().parent / name,
-        Path(__file__).resolve().parent.parent / name,
-    ]:
-        if c.exists():
-            return c
-    raise FileNotFoundError(name)
 
-def write_xlsx(df: pd.DataFrame, template_path: Path, out_path: Path) -> None:
-    wb = openpyxl.load_workbook(template_path)
-    ws = wb[wb.sheetnames[0]]
-
-    for r in range(3, 250):
-        for c in range(1, 8):
-            ws.cell(r, c).value = None
-
-    r0 = 3
-    for _, row in df.iterrows():
-        ws.cell(r0, 1).value = row["Outcome"]
-        ws.cell(r0, 2).value = row["Predictor"]
-        ws.cell(r0, 3).value = float(row["Effect"]) if np.isfinite(row["Effect"]) else None
-        ws.cell(r0, 4).value = float(row["CI_low"]) if np.isfinite(row["CI_low"]) else None
-        ws.cell(r0, 5).value = float(row["CI_high"]) if np.isfinite(row["CI_high"]) else None
-
-        if ws.max_column >= 7:
-            ws.cell(r0, 6).value = float(row["p_value"]) if np.isfinite(row["p_value"]) else None
-            ws.cell(r0, 7).value = _fmt_q(float(row["q_fdr"])) if np.isfinite(row["q_fdr"]) else ""
-        else:
-            ws.cell(r0, 6).value = _fmt_q(float(row["q_fdr"])) if np.isfinite(row["q_fdr"]) else ""
-
-        r0 += 1
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(out_path)
-
+# -------------------------
+# Main
+# -------------------------
 def main():
     root = Path(__file__).resolve().parents[1]
     data_dir = root / "data"
@@ -118,60 +106,102 @@ def main():
         if not p.exists():
             raise FileNotFoundError(p)
 
+    # ---- clinical ----
     clin = pd.read_csv(clin_csv)
+    clin = _resolve_panss_gen(clin)
+
+    # required base columns
+    req = {"anon_id", "site_public", "events_sum", "minutes_sum"}
+    miss = req - set(clin.columns)
+    if miss:
+        raise ValueError(f"fig5a_source_public.csv missing: {sorted(miss)}")
+
     num_cols = ["events_sum", "minutes_sum"] + COVARS + [c for c, _ in PRED_MAP]
     for c in num_cols:
         if c in clin.columns:
             clin[c] = pd.to_numeric(clin[c], errors="coerce")
     clin["site_public"] = clin["site_public"].astype(str)
+    clin["anon_id"] = clin["anon_id"].astype(str)
 
+    # SZ-only if group exists
     if "group" in clin.columns:
         clin["group"] = clin["group"].astype(str).str.upper().replace({"SC": "SZ"})
         clin = clin[clin["group"].isin(["SZ"])].copy()
 
+    # ---- id map (private) ----
     mp = pd.read_csv(id_map)
-    need = {"subject", "anon_id"}
-    if not need.issubset(mp.columns):
-        raise ValueError(f"id map missing columns: {sorted(need - set(mp.columns))}")
+    if not {"subject", "anon_id"}.issubset(mp.columns):
+        raise ValueError("fig5a_id_map_private.csv must have columns: subject, anon_id")
     mp = mp.copy()
     mp["subject"] = mp["subject"].map(canon_subject)
     mp["anon_id"] = mp["anon_id"].astype(str)
 
+    # ---- rate_epoch_subject_level ----
     rate = pd.read_csv(rate_csv)
-    need2 = {"subject", "freq", "n_epochs", "n_events", "recording_len_s", "n_events_in_epochs", "sum_epoch_dur_s"}
-    miss = need2 - set(rate.columns)
+
+    need_rate = {"subject", "freq", "n_epochs", "n_events", "n_events_in_epochs", "max_epoch_rate_hz"}
+    if INCLUDE_DENSITY:
+        need_rate |= {"sum_epoch_dur_s"}
+    miss = need_rate - set(rate.columns)
     if miss:
         raise ValueError(f"rate_epoch_subject_level missing columns: {sorted(miss)}")
 
     rate = rate.copy()
     rate["subject"] = rate["subject"].map(canon_subject)
     rate["freq"] = pd.to_numeric(rate["freq"], errors="coerce").astype(int)
-    for c in ["n_epochs", "n_events", "n_events_in_epochs", "sum_epoch_dur_s", "recording_len_s"]:
+
+    num_rate_cols = ["n_epochs", "n_events", "n_events_in_epochs", "max_epoch_rate_hz"]
+    if INCLUDE_DENSITY:
+        num_rate_cols.append("sum_epoch_dur_s")
+    for c in num_rate_cols:
         rate[c] = pd.to_numeric(rate[c], errors="coerce")
+
     rate = rate[rate["freq"].isin(FREQS_USE)].copy()
 
     rate["n_events_outside_epochs"] = rate["n_events"] - rate["n_events_in_epochs"]
 
-    agg = rate.groupby(["subject"], as_index=False).agg(
+    peak_agg = "max" if AGG_PEAK == "max" else "mean"
+
+    # pooled outcomes (subject level)
+    agg_dict = dict(
         clustered_epochs=("n_epochs", "sum"),
         outside_ripple_count=("n_events_outside_epochs", "sum"),
-        in_events=("n_events_in_epochs", "sum"),
-        in_time_s=("sum_epoch_dur_s", "sum"),
+        peak_rate_within_clustered_swrs=("max_epoch_rate_hz", peak_agg),
     )
-    agg["mean_within_epoch_density"] = agg["in_events"] / agg["in_time_s"]
-    agg.loc[(agg["in_time_s"] <= 0) | (~np.isfinite(agg["mean_within_epoch_density"])), "mean_within_epoch_density"] = np.nan
 
-    agg = agg.merge(mp, on="subject", how="left")
-    agg = agg.dropna(subset=["anon_id"]).copy()
+    if INCLUDE_DENSITY:
+        # optional: also compute mean density within epochs
+        # density = sum(in_events) / sum(in_time_s)
+        agg_dict.update(
+            in_events=("n_events_in_epochs", "sum"),
+            in_time_s=("sum_epoch_dur_s", "sum"),
+        )
+
+    agg = rate.groupby(["subject"], as_index=False).agg(**agg_dict)
+
+    if INCLUDE_DENSITY:
+        agg["mean_within_epoch_density"] = agg["in_events"] / agg["in_time_s"]
+        bad = (agg["in_time_s"] <= 0) | (~np.isfinite(agg["mean_within_epoch_density"]))
+        agg.loc[bad, "mean_within_epoch_density"] = np.nan
+
+    # attach anon_id
+    agg = agg.merge(mp, on="subject", how="left").dropna(subset=["anon_id"]).copy()
     agg["anon_id"] = agg["anon_id"].astype(str)
 
+    # merge
     D = clin.merge(agg, on="anon_id", how="inner")
+    D = D.replace([np.inf, -np.inf], np.nan).copy()
 
+    # outcomes list
     outcomes = [
         ("clustered_epochs", "Number of high-rate ripple epochs", "count", "IRR"),
         ("outside_ripple_count", "Ripple events outside high-rate epochs", "count", "IRR"),
-        ("mean_within_epoch_density", "Mean ripple density within high-rate epochs (events/s)", "cont", "beta"),
+        ("peak_rate_within_clustered_swrs", "Peak rate within clustered ripple events (counts/s)", "cont", "beta"),
     ]
+    if INCLUDE_DENSITY:
+        outcomes.append(
+            ("mean_within_epoch_density", "Mean ripple density within high-rate epochs (events/s)", "cont", "beta")
+        )
 
     fam = sm.families.NegativeBinomial(link=sm.families.links.Log())
 
@@ -187,7 +217,7 @@ def main():
             else:
                 cols_need = ["site_public", "events_sum", out_col, pred_col] + COVARS
 
-            X = D.replace([np.inf, -np.inf], np.nan).dropna(subset=cols_need).copy()
+            X = _dropna(D, cols_need)
             if X.empty:
                 continue
 
@@ -202,18 +232,23 @@ def main():
                     family=fam,
                     offset=np.log(X["minutes_sum"].astype(float))
                 ).fit(cov_type="HC3")
+
                 beta = float(fit.params[pred_col])
                 se = float(fit.bse[pred_col])
                 p = float(fit.pvalues[pred_col])
+
                 eff = float(np.exp(beta))
                 ci_low = float(np.exp(beta - 1.96 * se))
                 ci_high = float(np.exp(beta + 1.96 * se))
+
             else:
                 formula = f"{out_col} ~ {pred_col} + events_sum + " + " + ".join(COVARS) + " + C(site_public)"
                 fit = smf.ols(formula=formula, data=X).fit(cov_type="HC3")
+
                 beta = float(fit.params[pred_col])
                 se = float(fit.bse[pred_col])
                 p = float(fit.pvalues[pred_col])
+
                 eff = beta
                 ci_low = beta - 1.96 * se
                 ci_high = beta + 1.96 * se
@@ -241,15 +276,12 @@ def main():
     out_csv = out_dir / "Table_S11_clinical_associations_with_cluster_metrics.csv"
     out.to_csv(out_csv, index=False)
 
-    try:
-        tpl = _find_template(root, "supp_table11.xlsx")
-        out_xlsx = out_dir / "Supplementary_Table_S11_clinical_associations_with_cluster_metrics.xlsx"
-        write_xlsx(out, tpl, out_xlsx)
-    except Exception as e:
-        print("[WARN] Could not write xlsx:", repr(e))
-
     print("[OK] Written:")
     print(" -", out_csv)
+    if INCLUDE_DENSITY:
+        print("[INFO] INCLUDE_DENSITY=True: density outcome included in addition to peak rate.")
+    print(f"[INFO] Peak aggregation across freqs: AGG_PEAK='{AGG_PEAK}'")
+
 
 if __name__ == "__main__":
     main()
